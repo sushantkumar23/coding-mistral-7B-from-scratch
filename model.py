@@ -97,6 +97,36 @@ class CacheView:
         return torch.cat(interleaved_k, dim=0), torch.cat(interleaved_v, dim=0)
 
 
+class RotatingBufferCache:
+    """
+    This is an example that implements a less naive rotating buffer cache, allowing for variable
+    length sequences. Allocated cache is rectangular which is wasteful (see PageAttention for better mechanisms)
+    """
+    def __init__(self, n_layers: int, max_batch_size: int, sliding_window: int, n_kv_heads: int, head_dim: int):
+
+        self.sliding_window = sliding_window
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+
+        self.cache_k = torch.empty((
+            n_layers,
+            max_batch_size,
+            sliding_window,
+            n_kv_heads,
+            head_dim
+        ))
+
+        self.cache_v = torch.empty((
+            n_layers,
+            max_batch_size,
+            sliding_window,
+            n_kv_heads,
+            head_dim
+        ))
+        # holds the valid length for each batch element in the cache
+        self.kv_seqlens = None
+
+
 @dataclass
 class MoeArgs(Serializable):
     num_experts: int
@@ -179,6 +209,33 @@ class Attention(nn.Module):
 
         return self.wo(output.view(seqlen_sum, self.n_heads * self.head_dim))
 
+class FeedForward(nn.Module):
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+
+        self.w1 = nn.Linear(args.dim, args.hidden_dim, bias=False)
+        self.w2 = nn.Linear(args.hidden_dim, args.dim, bias=False)
+        self.w3 = nn.Linear(args.dim, args.hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_ = nn.functional.silu(self.w1(x)) * self.w3(x)
+        return self.w2(x_)
+
+
+class RMSNorm(nn.Module):
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
 
 
 class TransformerBlock(nn.Module):
@@ -188,7 +245,18 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.attention = Attention(args)
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.args = args
 
+        self.feed_forward: nn.Module = FeedForward(args=args)
+
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]) -> torch.Tensor:
+        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        h = x + r
+        r = self.feed_forward(self.ffn_norm(h))
+        out = h + r
+        return out
 
 
 
@@ -206,3 +274,5 @@ class Transformer(nn.Module):
         # Initialize all layers
         layers = [TransformerBlock(args=args) for _ in range(args.n_layers)]
 
+    def forward(self, input_ids: torch.Tensor, seqlens: List[int], cache: Optional[RotatingBufferCache] = None):
+        pass
